@@ -31,6 +31,8 @@ type Account struct {
 	UID          string `json:"uid"`
 	UserName     string `json:"user_name"`
 	DefaultModel string `json:"default_model"`
+	// Note 是用户给账号加的备注，用于区分同名账号；持久化在 state 文件里。
+	Note string `json:"note,omitempty"`
 
 	Auth   *auth.Auth       `json:"-"`
 	Client *upstream.Client `json:"-"`
@@ -253,6 +255,7 @@ func (p *Pool) List() []map[string]any {
 			"uid":               a.UID,
 			"nickname":          a.UserName,
 			"user_name":         a.UserName,
+			"note":              a.Note,
 			"default_model":     a.DefaultModel,
 			"checkin":           a.checkin,
 			"benefit":           a.benefit,
@@ -341,6 +344,23 @@ func (p *Pool) ClearCooldown(name string) bool {
 		}
 	}
 	return false
+}
+
+// SetNote 设置账号备注，返回更新后的备注；账号不存在返回 false。
+func (p *Pool) SetNote(name, note string) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, a := range p.accounts {
+		if a.Name != name && a.UID != name {
+			continue
+		}
+		a.mu.Lock()
+		a.Note = note
+		a.mu.Unlock()
+		p.saveState()
+		return note, true
+	}
+	return "", false
 }
 
 // RemoveAccount 从池中移除账号，返回被移除的账号。
@@ -1017,6 +1037,7 @@ func (p *Pool) loadState() {
 	}
 	var data []struct {
 		Name       string       `json:"name"`
+		Note       string       `json:"note,omitempty"`
 		ErrCount   int          `json:"err_count"`
 		CoolUntil  time.Time    `json:"cool_until"`
 		Disabled   bool         `json:"disabled"`
@@ -1033,6 +1054,7 @@ func (p *Pool) loadState() {
 		for _, s := range data {
 			if s.Name == a.Name {
 				a.mu.Lock()
+				a.Note = s.Note
 				a.errCount = s.ErrCount
 				a.coolUntil = s.CoolUntil
 				a.disabled = s.Disabled
@@ -1053,6 +1075,7 @@ func (p *Pool) saveState() {
 	}
 	type entry struct {
 		Name       string       `json:"name"`
+		Note       string       `json:"note,omitempty"`
 		ErrCount   int          `json:"err_count"`
 		CoolUntil  time.Time    `json:"cool_until"`
 		Disabled   bool         `json:"disabled"`
@@ -1067,6 +1090,7 @@ func (p *Pool) saveState() {
 		a.mu.Lock()
 		out = append(out, entry{
 			Name:       a.Name,
+			Note:       a.Note,
 			ErrCount:   a.errCount,
 			CoolUntil:  a.coolUntil,
 			Disabled:   a.disabled,

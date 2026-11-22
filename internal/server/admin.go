@@ -47,6 +47,65 @@ type uidBody struct {
 	Reason  string `json:"reason"`
 }
 
+// maxNoteLen 备注最大长度，避免面板被超长文本撑爆。
+const maxNoteLen = 100
+
+// adminSetAccountNote 设置/修改账号备注。
+func (h *Handler) adminSetAccountNote(w http.ResponseWriter, r *http.Request) {
+	var b struct {
+		UID  string `json:"uid"`
+		Note string `json:"note"`
+	}
+	defer r.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "bad body: " + err.Error()})
+		return
+	}
+	if err := json.Unmarshal(raw, &b); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "bad json: " + err.Error()})
+		return
+	}
+	uid := strings.TrimSpace(b.UID)
+	if uid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "uid required"})
+		return
+	}
+	acct := h.cfg.Pool.Get(uid)
+	if acct == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "account not found"})
+		return
+	}
+	note := strings.TrimSpace(b.Note)
+	if len([]rune(note)) > maxNoteLen {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok": false, "message": fmt.Sprintf("备注过长，最多 %d 个字符", maxNoteLen),
+		})
+		return
+	}
+	note = sanitizeNote(note)
+	if _, ok := h.cfg.Pool.SetNote(acct.UID, note); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "account not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "message": "备注已保存", "uid": acct.UID, "note": note,
+	})
+}
+
+// sanitizeNote 去掉控制字符与换行，备注只作为纯文本展示。
+func sanitizeNote(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return ' '
+		}
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 func readUIDBody(r *http.Request) (uidBody, error) {
 	var b uidBody
 	defer r.Body.Close()

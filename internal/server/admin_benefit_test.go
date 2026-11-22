@@ -335,3 +335,43 @@ func (c *adminCreditsClient) FetchCreditOverview(_ context.Context, _ upstream.S
 }
 
 func (c *adminCreditsClient) used() float64 { return 4000.71 }
+
+func TestAdminSetAccountNote(t *testing.T) {
+	a := auth.New("u1", "user1", "domain", "tok1", "ak", "sk", time.Now().Add(2*time.Hour).Format(time.RFC3339), "", "")
+	p, err := pool.New([]*auth.Auth{a}, pool.Config{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{Pool: p, APIKey: "test-key"})
+
+	post := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/admin/api/accounts/note", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer test-key")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	rec := post(`{"uid":"u1","note":"  工作号\n备用  "}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	accounts := p.List()
+	if got, _ := accounts[0]["note"].(string); got != "工作号 备用" {
+		t.Fatalf("stored note = %q, want %q", got, "工作号 备用")
+	}
+
+	if rec := post(`{"uid":"missing","note":"x"}`); rec.Code != http.StatusNotFound {
+		t.Fatalf("missing account status = %d, want 404", rec.Code)
+	}
+	long := strings.Repeat("备", 101)
+	if rec := post(`{"uid":"u1","note":"` + long + `"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("too long status = %d, want 400", rec.Code)
+	}
+	if rec := post(`{"uid":"u1","note":""}`); rec.Code != http.StatusOK {
+		t.Fatalf("clear note status = %d, want 200", rec.Code)
+	}
+	if got, _ := p.List()[0]["note"].(string); got != "" {
+		t.Fatalf("note after clear = %q, want empty", got)
+	}
+}

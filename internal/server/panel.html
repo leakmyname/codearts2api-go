@@ -94,6 +94,9 @@ input{font:inherit}
 .benefit-note{max-width:360px;word-break:break-word}
 .benefit-note.warn{color:var(--warn)}
 .row-actions{display:flex;gap:5px;flex-wrap:wrap;max-width:320px}
+.note-tag{display:inline-flex;align-items:center;gap:5px;margin-top:4px;padding:2px 7px;border-radius:4px;background:rgba(56,142,255,.12);color:var(--accent);font-size:11px;max-width:100%;word-break:break-word}
+.note-edit{display:flex;gap:5px;margin-top:5px;align-items:center;flex-wrap:wrap}
+.note-edit input{flex:1 1 150px;min-width:120px;padding:5px 7px;border-radius:5px;border:1px solid var(--line-strong);background:var(--surface);color:var(--text);font-size:12px}
 .link-btn{border:0;background:none;padding:0;color:var(--info);font-size:11.5px;text-decoration:underline;text-underline-offset:2px}
 .link-btn:hover{color:var(--accent-hover)}
 
@@ -351,6 +354,7 @@ const state = {
   oauthTimer: null,
   oauthBusy: false,
   expanded: new Set(),
+  editingNote: "",
 };
 
 /* ---------- utils ---------- */
@@ -548,6 +552,7 @@ function renderAccountRow(a, idx){
     `<button class="btn small" data-act="benefit" data-uid="${escapeAttr(uid)}" type="button">领取权益</button>`,
     `<button class="btn small" data-act="checkin" data-uid="${escapeAttr(uid)}" type="button">签到</button>`,
     `<button class="btn small" data-act="keepalive" data-uid="${escapeAttr(uid)}" type="button">保活</button>`,
+    `<button class="btn small" data-act="note" data-uid="${escapeAttr(uid)}" type="button">备注</button>`,
     a.disabled
       ? `<button class="btn small" data-act="enable" data-uid="${escapeAttr(uid)}" type="button">启用</button>`
       : `<button class="btn small danger" data-act="disable" data-uid="${escapeAttr(uid)}" type="button">禁用</button>`,
@@ -583,6 +588,13 @@ function renderAccountRow(a, idx){
         </div>
         <div class="sub mono" title="${escapeAttr(uid)}">${escapeHtml(shortUID(uid))}</div>
         ${tokenRemain ? `<div class="sub">${escapeHtml(tokenRemain)}</div>` : ""}
+        ${a.note ? `<div class="note-tag" title="${escapeAttr(a.note)}">备注：${escapeHtml(a.note)}</div>` : ""}
+        ${state.editingNote === uid ? `
+          <div class="note-edit">
+            <input type="text" maxlength="100" placeholder="给这个账号加个备注" value="${escapeAttr(a.note || "")}" data-note-input="${escapeAttr(uid)}"/>
+            <button class="btn small primary" data-act="note-save" data-uid="${escapeAttr(uid)}" type="button">保存</button>
+            <button class="btn small" data-act="note-cancel" type="button">取消</button>
+          </div>` : ""}
       </td>
       <td data-label="积分余额">${creditCell}</td>
       <td data-label="签到 / 福利">
@@ -642,6 +654,24 @@ $("acctBody").addEventListener("click", async (e) => {
     return;
   }
   const uid = btn.dataset.uid;
+  if (act === "note") {
+    state.editingNote = uid;
+    if (state.data) render(state.data);
+    const input = document.querySelector(`[data-note-input="${CSS.escape(uid)}"]`);
+    if (input) { input.focus(); input.select(); }
+    return;
+  }
+  if (act === "note-cancel") {
+    state.editingNote = "";
+    if (state.data) render(state.data);
+    return;
+  }
+  if (act === "note-save") {
+    const input = document.querySelector(`[data-note-input="${CSS.escape(uid)}"]`);
+    const note = input ? input.value : "";
+    state.editingNote = "";
+    return runAccountAction(btn, "/admin/api/accounts/note", {uid, note}, "备注已保存");
+  }
   if (act === "credits") return runAccountAction(btn, "/admin/api/credits/balance", {uid}, "积分已更新");
   if (act === "remove") {
     const a = (state.data?.accounts || []).find(x => x.uid === uid);
@@ -656,6 +686,22 @@ $("acctBody").addEventListener("click", async (e) => {
   if (act === "enable") return runAccountAction(btn, "/admin/api/accounts/enable", {uid}, "已启用");
   if (act === "disable") return runAccountAction(btn, "/admin/api/accounts/disable", {uid, reason:"manual disable from panel"}, "已禁用");
   if (act === "clear") return runAccountAction(btn, "/admin/api/accounts/clear-cooldown", {uid}, "已清冷却");
+});
+
+/* 备注输入框：回车保存，Esc 取消。 */
+$("acctBody").addEventListener("keydown", (e) => {
+  const input = e.target.closest("input[data-note-input]");
+  if (!input) return;
+  const uid = input.dataset.noteInput || "";
+  if (e.key === "Enter") {
+    e.preventDefault();
+    const saveBtn = document.querySelector(`button[data-act="note-save"][data-uid="${CSS.escape(uid)}"]`);
+    if (saveBtn) saveBtn.click();
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    state.editingNote = "";
+    if (state.data) render(state.data);
+  }
 });
 
 /* ---------- batch claim ---------- */

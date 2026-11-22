@@ -3,6 +3,7 @@ package pool
 import (
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -81,5 +82,32 @@ func TestRefreshSkewControlsThreshold(t *testing.T) {
 	// 真刷新需要网络，故只检查不触发的那一侧不报错）。
 	if err := p.CheckAndRefreshTokenWithin("u-skew", time.Hour); err != nil {
 		t.Fatalf("剩余 2h、skew=1h 不应触发刷新: %v", err)
+	}
+}
+
+func TestSetNotePersistsAcrossReload(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state.json")
+	a := auth.New("u1", "user", "domain", "token", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", "verifier")
+	p, err := New([]*auth.Auth{a}, Config{}, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := p.SetNote("u1", "  主账号  "); !ok {
+		t.Fatal("SetNote should find account by name")
+	}
+	if note, ok := p.SetNote("missing", "x"); ok {
+		t.Fatalf("SetNote on missing account = %q, want not found", note)
+	}
+	p2, err := New([]*auth.Auth{a}, Config{}, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := p2.List()
+	if len(list) != 1 {
+		t.Fatalf("list len = %d, want 1", len(list))
+	}
+	if got, _ := list[0]["note"].(string); got != "  主账号  " {
+		t.Fatalf("note after reload = %q, want %q", got, "  主账号  ")
 	}
 }

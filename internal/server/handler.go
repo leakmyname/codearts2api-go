@@ -173,6 +173,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/api/accounts/disable", h.withAuth(h.adminDisable))
 	h.mux.HandleFunc("POST /admin/api/accounts/clear-cooldown", h.withAuth(h.adminClearCooldown))
 	h.mux.HandleFunc("POST /admin/api/accounts/remove", h.withAuth(h.adminRemoveAccount))
+	h.mux.HandleFunc("POST /admin/api/accounts/note", h.withAuth(h.adminSetAccountNote))
 	h.mux.HandleFunc("POST /admin/api/credits/balance", h.withAuth(h.adminQueryCredits))
 	h.mux.HandleFunc("POST /admin/api/oauth/start", h.withAuth(h.adminOAuthStart))
 	h.mux.HandleFunc("POST /admin/api/oauth/poll", h.withAuth(h.adminOAuthPoll))
