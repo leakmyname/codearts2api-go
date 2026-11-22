@@ -40,7 +40,7 @@ type Account struct {
 	checkinMu sync.Mutex
 	checkin   *CheckinStatus
 	// benefit 保存最近一次限时福利领取结果，与账号健康状态分开。
-	benefit        *BenefitStatus
+	benefit *BenefitStatus
 	// credits 保存最近一次积分余额查询结果。
 	credits        *CreditsStatus
 	lastValidated  time.Time
@@ -70,15 +70,22 @@ type ErrorEntry struct {
 
 // CreditsStatus 账号积分余额。
 type CreditsStatus struct {
-	OK          bool      `json:"ok"`
-	Message     string    `json:"message"`
-	Total       float64   `json:"total"`
-	Used        float64   `json:"used"`
-	Remain      float64   `json:"remain"`
-	BonusRemain float64   `json:"bonus_remain"`
-	BasicRemain float64   `json:"basic_remain"`
-	Expiring    float64   `json:"expiring"`
-	CheckedAt   time.Time `json:"checked_at"`
+	OK              bool      `json:"ok"`
+	Message         string    `json:"message"`
+	Total           float64   `json:"total"`
+	Used            float64   `json:"used"`
+	Remain          float64   `json:"remain"`
+	BonusRemain     float64   `json:"bonus_remain"`
+	BasicRemain     float64   `json:"basic_remain"`
+	OnDemandRemain  float64   `json:"ondemand_remain"`
+	Expiring        float64   `json:"expiring"`
+	PackageName     string    `json:"package_name,omitempty"`
+	SpecCode        string    `json:"spec_code,omitempty"`
+	PackageStatus   string    `json:"package_status,omitempty"`
+	IsCreditPackage bool      `json:"is_credit_package"`
+	IsTokenPackage  bool      `json:"is_token_package"`
+	PackageEndDate  string    `json:"package_end_date,omitempty"`
+	CheckedAt       time.Time `json:"checked_at"`
 }
 
 // maxRecentErrs 保留的最近错误条数。

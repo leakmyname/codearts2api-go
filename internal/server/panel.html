@@ -534,8 +534,10 @@ function renderAccountRow(a, idx){
     : (cr.ok
         ? `<div class="credit-num">${fmtNum(cr.remain)}</div>
            <div class="sub credit-sub">总额 ${fmtNum(cr.total)} · 已用 ${fmtNum(cr.used)}</div>
-           <div class="sub credit-sub">赠送 ${fmtNum(cr.bonus_remain)} · 基础 ${fmtNum(cr.basic_remain)}</div>
+           <div class="sub credit-sub">赠送 ${fmtNum(cr.bonus_remain)} · 基础 ${fmtNum(cr.basic_remain)}${Number(cr.ondemand_remain) ? " · 按需 " + fmtNum(cr.ondemand_remain) : ""}</div>
            ${Number(cr.expiring) > 0 ? `<div class="sub credit-sub">即将过期 ${fmtNum(cr.expiring)}</div>` : ""}
+           ${cr.package_name ? `<div class="sub credit-sub">套餐 ${escapeHtml(cr.package_name)}${cr.package_end_date ? " · 到期 " + escapeHtml(cr.package_end_date) : ""}</div>` : ""}
+           ${cr.is_credit_package === false ? `<div class="sub credit-sub">Token 计费账户（不参与签到活动）</div>` : ""}
            ${cr.checked_at ? `<div class="sub">${escapeHtml(fmtTime(cr.checked_at))}</div>` : ""}`
         : `<span class="muted" title="${escapeAttr(cr.message || "")}">查询失败</span>`);
   const tokenRemain = a.token_remaining && a.token_remaining !== "0s" ? "Token " + a.token_remaining : "";

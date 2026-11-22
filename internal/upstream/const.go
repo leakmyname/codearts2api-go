@@ -43,4 +43,6 @@ const (
 
 	// 积分余额（官方控制台「套餐概览」，AK/SK 签名即可，无需浏览器 Cookie）。
 	EpPackageOverview = "/snap-manager/v1/package/overview"
+	// 积分/套餐详细信息（IDE「账户信息」面板的数据源，含套餐名与积分包分类）。
+	EpStatisticsPlugin = "/snap-manager/v1/statistics/plugin"
 )

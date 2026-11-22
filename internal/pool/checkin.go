@@ -157,12 +157,19 @@ func (p *Pool) QueryCredits(ctx context.Context, name string) (CreditsStatus, er
 		SecretAccessKey: sk,
 	})
 	status := CreditsStatus{
-		Total:       ov.Total,
-		Used:        ov.Used,
-		Remain:      ov.Remain,
-		BonusRemain: ov.BonusRemain,
-		BasicRemain: ov.BasicRemain,
-		Expiring:    ov.Expiring,
+		Total:           ov.Total,
+		Used:            ov.Used,
+		Remain:          ov.Remain,
+		BonusRemain:     ov.BonusRemain,
+		BasicRemain:     ov.BasicRemain,
+		OnDemandRemain:  ov.OnDemandRemain,
+		Expiring:        ov.Expiring,
+		PackageName:     ov.PackageName,
+		SpecCode:        ov.SpecCode,
+		PackageStatus:   ov.PackageStatus,
+		IsCreditPackage: ov.IsCreditPackage,
+		IsTokenPackage:  ov.IsTokenPackage,
+		PackageEndDate:  ov.PackageEndDate,
 	}
 	if err != nil {
 		status.OK = false

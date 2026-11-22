@@ -17,6 +17,11 @@ const (
 	EpCreditClaim    = "/v1/ops/claim"
 	EpCreditConfirm  = "/v1/ops/confirm"
 	creditChannel    = "IDE"
+
+	// claimedBusinessCode 是「尚未到达权益刷新时间」的业务码。
+	// 实测重复领取每日签到时 HTTP 200 + {"code":40001,...}。
+	// 这不是故障：活动列表的 claimable 会短暂滞后，仍显示可领。
+	claimedBusinessCode = 40001
 )
 
 // CreditCampaign 是活动投放接口的脱敏条目；不保留 access 中的活动票据。
@@ -95,6 +100,12 @@ func (c *Client) creditRequest(ctx context.Context, method, path string, body an
 		return nil, &ApiError{Code: *envelope.Code, Status: http.StatusBadRequest, Path: req.URL.Path, Message: envelope.Message}
 	}
 	return envelope.Data, nil
+}
+
+// alreadyClaimed 判断错误是否为「今天已经领过」的业务码。
+func alreadyClaimed(err error) bool {
+	apiErr, ok := err.(*ApiError)
+	return ok && apiErr.Code == claimedBusinessCode
 }
 
 // FetchCreditCampaigns 只读查询活动，端点位于 snap 根路径而非 snap-manager。
@@ -209,7 +220,7 @@ func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, c
 		return res
 	case "CLAIMED":
 		// 已到账但尚未确认；不得重复领取。
-	case "ELIGIBLE":
+	case "ELIGIBLE", "ENTRY":
 		if !campaign.Claimable {
 			res.OK, res.Message = false, "暂不可领取，稍后重试"
 			return res
@@ -218,28 +229,59 @@ func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, c
 			"campaignId": campaign.ID, "channel": creditChannel,
 			"idempotentKey": fmt.Sprintf("claim_%d_%d", campaign.ID, now.UnixMilli()),
 		}, cred)
-		if err != nil {
+		if alreadyClaimed(err) {
+			// 上游说「还没到刷新时间」= 今天已领过，属于成功而不是失败。
+			res.Status = "CLAIMED"
+			// 积分不是本次新领到的，不计入本次领取量。
+			res.Credits = 0
+			res.Message = fmt.Sprintf("今日已领取（%g 积分）", campaign.BenefitAmount)
+		} else if err != nil {
 			res.OK, res.Message = false, err.Error()
 			return res
-		}
-		res.Status = "CLAIMED"
-		res.Credits = campaign.PendingTotalAmount
-		if res.Credits <= 0 {
-			res.Credits = campaign.BenefitAmount
+		} else {
+			res.Status = "CLAIMED"
+			res.Credits = campaign.PendingTotalAmount
+			if res.Credits <= 0 {
+				res.Credits = campaign.BenefitAmount
+			}
 		}
 	case "":
 		res.Message = "未获得活动资格"
 		return res
 	default:
-		res.OK, res.Message = false, "未知活动状态: "+res.Status
-		return res
+		// 上游新增状态时：只要仍可领取就照常领取（活动自动兼容），
+		// 不可领取才记为状态未知，避免把账号整体判为失败。
+		if !campaign.Claimable {
+			res.OK, res.Message = false, "未知活动状态: "+res.Status
+			return res
+		}
+		_, err := c.creditRequest(ctx, http.MethodPost, EpCreditClaim, map[string]any{
+			"campaignId": campaign.ID, "channel": creditChannel,
+			"idempotentKey": fmt.Sprintf("claim_%d_%d", campaign.ID, now.UnixMilli()),
+		}, cred)
+		if alreadyClaimed(err) {
+			res.Status = "CLAIMED"
+			res.Credits = 0
+			res.Message = fmt.Sprintf("今日已领取（%g 积分）", campaign.BenefitAmount)
+		} else if err != nil {
+			res.OK, res.Message = false, err.Error()
+			return res
+		} else {
+			res.Status = "CLAIMED"
+			res.Credits = campaign.PendingTotalAmount
+			if res.Credits <= 0 {
+				res.Credits = campaign.BenefitAmount
+			}
+		}
 	}
 	if _, err := c.creditRequest(ctx, http.MethodPost, EpCreditConfirm, map[string]any{"campaignId": campaign.ID}, cred); err != nil {
 		res.OK, res.Message = false, "已领取，确认失败，稍后重试: "+err.Error()
 		return res
 	}
 	res.Status = "CONFIRMED"
-	res.Message = "已补确认"
+	if res.Message == "" {
+		res.Message = "已补确认"
+	}
 	if res.Credits > 0 {
 		res.Message = fmt.Sprintf("领取成功（%g 积分）", res.Credits)
 	}

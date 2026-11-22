@@ -129,7 +129,9 @@ func TestCheckinNewUserAndMalformedResponses(t *testing.T) {
 		wantCredits           float64
 	}{
 		{name: "new user", claim: `{"code":0}`, wantOK: true, wantConfirm: 1, wantCredits: 4000},
-		{name: "claim business failure", claim: `{"code":40001,"message":"not ready"}`},
+		// 40001 = 「今天已领过」：不是故障，应当按已领取处理并继续 confirm。
+		{name: "claim already claimed", claim: `{"code":40001,"message":"尚未到达权益刷新时间，暂时无法领取"}`, wantOK: true, wantConfirm: 1},
+		{name: "claim business failure", claim: `{"code":50001,"message":"boom"}`},
 		{name: "claim missing code", claim: `{"message":"ok"}`},
 		{name: "empty campaigns", delivery: `{"code":0,"data":{"items":[]}}`, wantOK: true},
 		{name: "missing items", delivery: `{"code":0,"data":{}}`, wantErr: true},
@@ -169,6 +171,39 @@ func TestCheckinNewUserAndMalformedResponses(t *testing.T) {
 				t.Fatalf("result=%+v err=%v confirms=%d", res, err, confirms)
 			}
 		})
+	}
+}
+
+// 40001「尚未到达权益刷新时间」= 今天已经领过。它是 HTTP 200 的业务码，
+// 重复点击签到时最常出现，不能当成失败，更不能计入本次领取量。
+func TestCheckinAlreadyClaimedBusinessCode(t *testing.T) {
+	var confirms int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case EpCreditDelivery:
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"items":[{"campaignId":34,"title":"每日签到领100积分","status":"ELIGIBLE","claimable":true,"benefitUnit":"CREDIT","benefitAmount":100,"pendingTotalAmount":100}]}}`)
+		case EpCreditClaim:
+			_, _ = fmt.Fprint(w, `{"code":40001,"message":"尚未到达权益刷新时间，暂时无法领取","data":null}`)
+		case EpCreditConfirm:
+			confirms++
+			_, _ = fmt.Fprint(w, `{"code":0}`)
+		}
+	}))
+	defer srv.Close()
+	c := New(time.Second)
+	c.snapBase = srv.URL
+	res, err := c.Checkin(context.Background(), SignCredential{})
+	if err != nil || !res.OK {
+		t.Fatalf("already claimed must not fail: result=%+v err=%v", res, err)
+	}
+	if res.Credits != 0 {
+		t.Fatalf("already claimed must not count credits: %+v", res)
+	}
+	if confirms != 1 {
+		t.Fatalf("confirm not called after already-claimed: %d", confirms)
+	}
+	if !strings.Contains(res.Message, "今日已领取") {
+		t.Fatalf("unexpected message: %q", res.Message)
 	}
 }
 
