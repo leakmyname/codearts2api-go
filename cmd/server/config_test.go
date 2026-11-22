@@ -59,6 +59,34 @@ func TestLoadToleratesExampleConfigComments(t *testing.T) {
 	}
 }
 
+// credits_exclude 支持 JSON 列表和 CA2A_CREDITS_EXCLUDE 逗号分隔两种写法。
+func TestCreditsExcludeConfigAndEnv(t *testing.T) {
+	t.Setenv("CA2A_API_KEY", "test-key")
+	t.Setenv("CA2A_CREDITS_EXCLUDE", "")
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"credits_exclude":["34","学生专属"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.CreditsExclude) != 2 || cfg.CreditsExclude[0] != "34" {
+		t.Fatalf("credits_exclude 未生效: %v", cfg.CreditsExclude)
+	}
+	if len(cfg.ToPoolConfig().CreditsExclude) != 2 {
+		t.Fatalf("credits_exclude 未透传给池: %v", cfg.ToPoolConfig().CreditsExclude)
+	}
+	t.Setenv("CA2A_CREDITS_EXCLUDE", "39, 签到 ,")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.CreditsExclude) != 2 || cfg.CreditsExclude[0] != "39" || cfg.CreditsExclude[1] != "签到" {
+		t.Fatalf("环境变量覆盖 credits_exclude 失败: %v", cfg.CreditsExclude)
+	}
+}
+
 func TestStripJSONCommentsKeepsStrings(t *testing.T) {
 	raw := []byte("{\n" +
 		"  // 行注释\n" +

@@ -127,6 +127,10 @@ type Client struct {
 	// Each pool account has its own client. Keep accepted model IDs separate
 	// for its normal and benefit routes.
 	chatModelIDs sync.Map // chatModelKey -> accepted spelling
+
+	// creditsExclude 活动积分自动领取的排除项。匹配活动 ID 或标题（子串，
+	// 不区分大小写），命中则不自动领取。留空表示不排除任何活动。
+	creditsExclude []string
 }
 
 // srcFailCooldown 上游某一来源连续失败后的退避窗口。
@@ -178,6 +182,12 @@ func (c *Client) SetBenefitAutoClaim(v bool) { c.claimAuto.Store(v) }
 
 // BenefitAutoClaim 报告是否开启自动领取。
 func (c *Client) BenefitAutoClaim() bool { return c.claimAuto.Load() }
+
+// SetCreditsExclude 设置活动积分自动领取的排除项（活动 ID 或标题子串）。
+// 上游新增活动时会自动参与领取；命中排除项的活动一律不领。
+func (c *Client) SetCreditsExclude(rules []string) {
+	c.creditsExclude = append([]string(nil), rules...)
+}
 
 // snapURL 拼接 snap-access 主机地址。
 func (c *Client) snapURL(path string) string { return c.snapBase + path }
@@ -318,7 +328,8 @@ func (c *Client) requestToken(ctx context.Context, cfg LoginConfig, form url.Val
 			code := tokenErr.ErrorCode
 			if tokenErr.Error == "invalid_grant" || strings.Contains(code, "ExpiredRefreshToken") ||
 				strings.Contains(code, "InvalidDPoPHeader") || strings.Contains(code, "invalid client id") ||
-				strings.Contains(strings.ToLower(tokenErr.ErrorMessage), "has been used") {
+				strings.Contains(strings.ToLower(tokenErr.ErrorMessage), "has been used") ||
+				isTerminalRefreshCode(code, tokenErr.ErrorMessage) {
 				return nil, &RefreshTokenExpiredError{
 					Status: resp.StatusCode,
 					Message: fmt.Sprintf("refresh_token expired or rejected: http=%d error=%s code=%s msg=%s",
@@ -346,6 +357,22 @@ func (c *Client) requestToken(ctx context.Context, cfg LoginConfig, form url.Val
 		return nil, fmt.Errorf("token response missing credentials: %s", truncateStr(string(raw), 200))
 	}
 	return &out, nil
+}
+
+// isTerminalRefreshCode 识别「终态失效」的续期错误。
+//
+// 除 IAM.ExpiredRefreshToken 外，华为云 STS 还会用 STS5.1806 报
+// "invalid refresh token: 'refresh code has expired'"（实测 2026-11-22）。
+// 这类错误重试没有意义，只能重新授权，必须归到 RefreshTokenExpiredError，
+// 否则账号会一直留在池里反复失败。
+func isTerminalRefreshCode(code, msg string) bool {
+	if strings.Contains(code, "STS5.1806") || strings.Contains(code, "STS5.1805") {
+		return true
+	}
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "refresh code has expired") ||
+		strings.Contains(lower, "invalid refresh token") ||
+		strings.Contains(lower, "refresh token expired")
 }
 
 // PollTicket 轮询登录结果（兜底通道）。
@@ -824,7 +851,10 @@ func CallerIdentity(cred SignCredential) (uid, name, domain string, err error) {
 
 // CurrentUser 用 STS 凭证查账号身份：GET {snap}/snap-manager/v1/current/user。
 func CurrentUser(cred SignCredential) (uid, name, domain string, err error) {
-	raw, err := signedGet(SnapEngineApiHost+EpCurrentUser, cred, "")
+	// 必须带 snap-manager 前缀：漏掉会返回 APIG.0101 API does not exist，
+	// 上层随即回退到 caller-identity，把 IAM principal_id 误当成 user_id，
+	// 导致同一个账号在账号池里被重复添加。
+	raw, err := signedGet(SnapManagerHost+EpCurrentUser, cred, "")
 	if err != nil {
 		return "", "", "", err
 	}

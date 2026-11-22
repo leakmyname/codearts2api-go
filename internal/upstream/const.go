@@ -40,4 +40,7 @@ const (
 	EpOAuthTokens    = "/v1/oauth2/tokens"
 	EpCurrentUser    = "/v1/current/user"
 	EpCallerIdentity = "/v5/caller-identity"
+
+	// 积分余额（官方控制台「套餐概览」，AK/SK 签名即可，无需浏览器 Cookie）。
+	EpPackageOverview = "/snap-manager/v1/package/overview"
 )

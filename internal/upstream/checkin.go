@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -123,10 +124,16 @@ func (c *Client) Checkin(ctx context.Context, cred SignCredential) (CheckinResul
 	}
 	out := CheckinResult{OK: true, Campaigns: make([]CreditClaimResult, 0)}
 	for _, campaign := range campaigns {
-		if campaign.ID != 1 && campaign.ID != 4 {
+		if !c.autoClaimCampaign(campaign) {
 			continue
 		}
 		if campaign.BenefitUnit != "" && campaign.BenefitUnit != "CREDIT" {
+			continue
+		}
+		if !participates(campaign) {
+			// 上游没给该账号资格（status 为空）或暂时不可领取：静默跳过，
+			// 不算失败、不进面板文案。上游每次投放都带全部活动，只有真正
+			// 属于该账号的才会返回资格。
 			continue
 		}
 		res := c.claimCreditCampaign(ctx, cred, campaign, time.Now())
@@ -143,6 +150,44 @@ func (c *Client) Checkin(ctx context.Context, cred SignCredential) (CheckinResul
 		out.Message = "无可领取的签到或新手活动"
 	}
 	return out, nil
+}
+
+// participates 判断账号是否真的参与该活动。
+//
+// 上游投放接口会返回该产品的全部活动，status 为空表示账号没有该活动资格；
+// status=ELIGIBLE 但 claimable=false 表示资格在但当前不可领取。两者都不该
+// 出现在签到结果里。
+func participates(campaign CreditCampaign) bool {
+	switch strings.TrimSpace(campaign.Status) {
+	case "":
+		return false
+	case "ELIGIBLE":
+		return campaign.Claimable
+	default:
+		return true
+	}
+}
+
+// autoClaimCampaign 判断活动是否属于自动领取范围。
+//
+// 判定依据是**上游的资格结论**而不是活动 ID 或标题：上游只为账号真正有资格的
+// 活动返回 claimable=true，因此「上游说有资格就领」可以自动兼容后续新增的
+// 每日签到、新活动，���不会误领需要额外资格的活动（学生认证、邀请返利等，
+// 上游对这类活动返回 claimable=false 或空 status）。
+//
+// CreditsExclude 提供例外：标题或 ID 命中排除列表的活动一律不领，
+// 用于关掉自动参与某个新活动。
+func (c *Client) autoClaimCampaign(campaign CreditCampaign) bool {
+	for _, rule := range c.creditsExclude {
+		if rule == "" {
+			continue
+		}
+		if strings.EqualFold(rule, strconv.Itoa(campaign.ID)) ||
+			strings.Contains(strings.ToLower(campaign.Title), strings.ToLower(rule)) {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, campaign CreditCampaign, now time.Time) CreditClaimResult {

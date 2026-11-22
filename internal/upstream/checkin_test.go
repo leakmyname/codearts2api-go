@@ -27,7 +27,8 @@ func TestCheckinTransitionsAndEligibility(t *testing.T) {
 		{name: "confirmed", status: "CONFIRMED", wantOK: true},
 		{name: "consumed", status: "CONSUMED", wantOK: true},
 		{name: "not eligible", wantOK: true},
-		{name: "not yet claimable", status: "ELIGIBLE"},
+		// 上游说 ELIGIBLE 但 claimable=false：没有可领的东西，静默跳过。
+		{name: "not yet claimable", status: "ELIGIBLE", wantOK: true},
 		{name: "unknown status", status: "CHANGED"},
 		{name: "expired", status: "ELIGIBLE", claimable: true, end: "2020-01-01T00:00:00Z", wantOK: true},
 		{name: "not started", status: "ELIGIBLE", claimable: true, start: "2100-01-01T00:00:00+08:00", wantOK: true},
@@ -46,8 +47,8 @@ func TestCheckinTransitionsAndEligibility(t *testing.T) {
 					}
 					_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"items": []any{
 						map[string]any{"campaignId": 1, "title": "daily", "status": tc.status, "claimable": tc.claimable, "benefitUnit": "CREDIT", "benefitAmount": 1000, "pendingTotalAmount": 1000, "extra": map[string]string{"endTime": tc.end, "startTime": tc.start}},
-						map[string]any{"campaignId": 2, "claimable": true, "status": "ELIGIBLE"},
-						map[string]any{"campaignId": 3, "claimable": true, "status": "ELIGIBLE"},
+						map[string]any{"campaignId": 2, "claimable": false, "status": "ELIGIBLE"},
+						map[string]any{"campaignId": 3, "claimable": true, "status": ""},
 					}}})
 					return
 				}
@@ -166,6 +167,129 @@ func TestCheckinNewUserAndMalformedResponses(t *testing.T) {
 			res, err := c.Checkin(context.Background(), SignCredential{})
 			if (err != nil) != tc.wantErr || res.OK != tc.wantOK || confirms != tc.wantConfirm || res.Credits != tc.wantCredits {
 				t.Fatalf("result=%+v err=%v confirms=%d", res, err, confirms)
+			}
+		})
+	}
+}
+
+// TestCheckinStableAcrossCampaignIDRotation 固定「活动 ID 会变」这一上游行为。
+// 每日签到从 1 轮换到 34 后，旧实现按 ID 过滤会静默跳过签到。现在以「上游资格
+// 结论」为准：claimable=true 的活动一律领取，上游新增活动天然兼容；上游对无
+// 资格的活动返回空 status 或 claimable=false，这些不领。
+func TestCheckinStableAcrossCampaignIDRotation(t *testing.T) {
+	var claimed []int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case EpCreditDelivery:
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"items":[
+				{"campaignId":34,"title":"每日签到领100积分","status":"ELIGIBLE","claimable":true,"benefitUnit":"CREDIT","benefitAmount":100,"pendingTotalAmount":100},
+				{"campaignId":4,"title":"新用户注册送 4000 积分","status":"CONFIRMED","benefitUnit":"CREDIT","benefitAmount":4000},
+				{"campaignId":39,"title":"2026年学生专属福利","status":"ELIGIBLE","claimable":false,"benefitUnit":"CREDIT","benefitAmount":5000},
+				{"campaignId":2,"title":"学生认证领积分","status":"","claimable":true,"benefitUnit":"CREDIT","benefitAmount":4000}
+			]}}`)
+		case EpCreditClaim:
+			var body struct {
+				ID int `json:"campaignId"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			claimed = append(claimed, body.ID)
+			_, _ = fmt.Fprint(w, `{"code":0}`)
+		case EpCreditConfirm:
+			_, _ = fmt.Fprint(w, `{"code":0}`)
+		}
+	}))
+	defer srv.Close()
+	c := New(time.Second)
+	c.snapBase = srv.URL
+	res, err := c.Checkin(context.Background(), SignCredential{})
+	if err != nil || !res.OK {
+		t.Fatalf("result=%+v err=%v", res, err)
+	}
+	if !reflect.DeepEqual(claimed, []int{34}) {
+		t.Fatalf("claimed campaigns = %v, want only daily check-in 34", claimed)
+	}
+	if res.Credits != 100 {
+		t.Fatalf("credits = %g, want 100", res.Credits)
+	}
+}
+
+// TestCheckinClaimsBrandNewCampaign 验证上游新增的活动（ID 未登记）只要上游
+// 判定有资格就会被领取，不需要改代码。
+func TestCheckinClaimsBrandNewCampaign(t *testing.T) {
+	var claimed []int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case EpCreditDelivery:
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"items":[
+				{"campaignId":108,"title":"全新上线福利","status":"ELIGIBLE","claimable":true,"benefitUnit":"CREDIT","benefitAmount":300,"pendingTotalAmount":300}
+			]}}`)
+		case EpCreditClaim:
+			var body struct {
+				ID int `json:"campaignId"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			claimed = append(claimed, body.ID)
+			_, _ = fmt.Fprint(w, `{"code":0}`)
+		case EpCreditConfirm:
+			_, _ = fmt.Fprint(w, `{"code":0}`)
+		}
+	}))
+	defer srv.Close()
+	c := New(time.Second)
+	c.snapBase = srv.URL
+	res, err := c.Checkin(context.Background(), SignCredential{})
+	if err != nil || !res.OK {
+		t.Fatalf("result=%+v err=%v", res, err)
+	}
+	if !reflect.DeepEqual(claimed, []int{108}) || res.Credits != 300 {
+		t.Fatalf("claimed=%v credits=%g, want [108] 300", claimed, res.Credits)
+	}
+}
+
+// TestCheckinExcludeRules 验证排除项可按活动 ID 或标题阻止领取。
+func TestCheckinExcludeRules(t *testing.T) {
+	tests := []struct {
+		name  string
+		rules []string
+	}{
+		{name: "by id", rules: []string{"108"}},
+		{name: "by title", rules: []string{"福利"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var claimed []int
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case EpCreditDelivery:
+					_, _ = fmt.Fprint(w, `{"code":0,"data":{"items":[
+						{"campaignId":108,"title":"全新上线福利","status":"ELIGIBLE","claimable":true,"benefitUnit":"CREDIT","benefitAmount":300},
+						{"campaignId":109,"title":"每日签到领100积分","status":"ELIGIBLE","claimable":true,"benefitUnit":"CREDIT","benefitAmount":100}
+					]}}`)
+				case EpCreditClaim:
+					var body struct {
+						ID int `json:"campaignId"`
+					}
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					claimed = append(claimed, body.ID)
+					_, _ = fmt.Fprint(w, `{"code":0}`)
+				case EpCreditConfirm:
+					_, _ = fmt.Fprint(w, `{"code":0}`)
+				}
+			}))
+			defer srv.Close()
+			c := New(time.Second)
+			c.snapBase = srv.URL
+			c.SetCreditsExclude(tc.rules)
+			if _, err := c.Checkin(context.Background(), SignCredential{}); err != nil {
+				t.Fatalf("checkin: %v", err)
+			}
+			for _, id := range claimed {
+				if id == 108 {
+					t.Fatalf("excluded campaign claimed: %v", claimed)
+				}
+			}
+			if !reflect.DeepEqual(claimed, []int{109}) {
+				t.Fatalf("claimed=%v, want [109]", claimed)
 			}
 		})
 	}

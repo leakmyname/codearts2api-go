@@ -34,6 +34,10 @@ type oauthSession struct {
 	Done           bool
 	Err            string
 	TicketFallback bool
+	// AccountUID/AccountName 记录登录成功后落盘的账号标识，
+	// 供轮询接口把新账号信息回传给前端（前端据此等待账号出现在列表里）。
+	AccountUID  string
+	AccountName string
 }
 
 type oauthStore struct {
@@ -266,7 +270,13 @@ func (h *Handler) adminOAuthPoll(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "status": "error", "message": sess.Err})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "done", "message": "登录成功"})
+		account := map[string]any{}
+		if sess.AccountUID != "" {
+			account = map[string]any{"uid": sess.AccountUID, "nickname": sess.AccountName}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "status": "done", "message": "登录成功", "account": account,
+		})
 		return
 	}
 	// 新式 OAuth 必须等待 authorization code；只有 Portal 明确回调
@@ -293,19 +303,22 @@ func (h *Handler) adminOAuthPoll(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if err := h.saveLoginResult(tok, sess.Verifier); err != nil {
+	uid, name, err := h.saveLoginResult(tok, sess.Verifier)
+	if err != nil {
 		sess.Done = true
 		sess.Err = err.Error()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "status": "error", "message": err.Error()})
 		return
 	}
 	sess.Done = true
+	sess.AccountUID = uid
+	sess.AccountName = name
 	h.oauth.del(req.SessionID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
 		"status":  "done",
-		"message": fmt.Sprintf("登录成功：%s (%s)", nonempty(tok.UserName, "未命名"), shortID(tok.UserID)),
-		"account": map[string]any{"uid": tok.UserID, "nickname": tok.UserName},
+		"message": fmt.Sprintf("登录成功：%s (%s)", nonempty(name, "未命名"), shortID(uid)),
+		"account": map[string]any{"uid": uid, "nickname": name},
 	})
 }
 
@@ -346,15 +359,18 @@ func (h *Handler) adminOAuthImportCallback(w http.ResponseWriter, r *http.Reques
 			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "status": "error", "message": exchangeErr.Error()})
 			return
 		}
-		if err := h.saveLoginResult(tok, sess.Verifier, sess.DPoPPrivateKey); err != nil {
+		uid, name, err := h.saveLoginResult(tok, sess.Verifier, sess.DPoPPrivateKey)
+		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "status": "error", "message": err.Error()})
 			return
 		}
+		sess.AccountUID = uid
+		sess.AccountName = name
 		sess.Done = true
 		h.oauth.del(req.SessionID)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": true, "status": "done", "message": "OAuth 登录成功，已保存可自动续期凭据",
-			"account": map[string]any{"uid": tok.UserID, "nickname": tok.UserName},
+			"account": map[string]any{"uid": uid, "nickname": name},
 		})
 		return
 	}

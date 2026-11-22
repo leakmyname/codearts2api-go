@@ -54,6 +54,9 @@ type Config struct {
 	BenefitAutoClaim bool `json:"benefit_auto_claim"`
 	// CreditsAutoClaim 每次 watchdog 轮询领取每日签到和新手活动积分（默认 true）。
 	CreditsAutoClaim bool `json:"credits_auto_claim"`
+	// CreditsExclude 不自动领取的活动（活动 ID 或标题子串，逗号分隔）。
+	// 留空表示上游判定有资格的活动全部自动领取，上游新增活动天然兼容。
+	CreditsExclude []string `json:"credits_exclude"`
 
 	Upstream struct {
 		TimeoutSeconds int `json:"timeout_seconds"`
@@ -230,6 +233,21 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("CA2A_CREDITS_AUTO_CLAIM"); v != "" {
 		c.CreditsAutoClaim = v == "1" || strings.EqualFold(v, "true")
 	}
+	if v := os.Getenv("CA2A_CREDITS_EXCLUDE"); v != "" {
+		c.CreditsExclude = splitList(v)
+	}
+}
+
+// splitList 解析逗号分隔的列表项，去空白并丢弃空项。
+func splitList(v string) []string {
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if s := strings.TrimSpace(p); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func (c *Config) normalize() error {
@@ -287,5 +305,6 @@ func (c *Config) ToPoolConfig() pool.Config {
 		RefreshSkew:     time.Duration(c.Watch.RefreshSkewM) * time.Minute,
 		MaxConcurrent:   c.MaxConcurrent,
 		KeepaliveWindow: dur,
+		CreditsExclude:  c.CreditsExclude,
 	}
 }

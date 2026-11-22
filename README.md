@@ -53,6 +53,20 @@ curl -X POST http://127.0.0.1:7866/v1/chat/completions \
 浏览器打开 **http://127.0.0.1:7866/** 即 WebUI：账号/token 状态、对话测试（流式/非流式）。多轮上下文按账号自动续接（chat_id 分组）；也可用请求头
 `X-Codearts-Chat-Id: <chatId>` 或 body 里 `conversation_id` 显式指定会话。
 
+WebUI 控制台包含：账号列表（健康/冷却/禁用、token 剩余时间、签到与活动结果、
+最近错误的**原文与时间**、可展开的最近错误明细）、单账号操作（校验 / 领取权益 /
+签到 / 保活 / 启用禁用 / 清冷却）、「领取所有账号权益」批量领取，以及 OAuth
+「＋ 授权登录」。所有按钮点击后立即禁用并显示「处理中…」，完成后用 toast 反馈。
+OAuth 新增账号会自动出现在列表里（无需手动刷新页面），新账号带「新」标记。
+
+每个账号还可以「查询积分」查看真实余额，或用顶部「查询全部积分」一次拉完。积分余额
+来自官方控制台套餐概览接口 `GET {snap-access}/snap-manager/v1/package/overview`，
+用账号自己的 STS 临时 AK/SK 签名请求，不依赖浏览器 Cookie；返回赠送积分剩余、
+基础包剩余与即将过期积分。查询失败只记录提示，不会把账号标记为不健康。
+
+「移除」会把账号从账号池中删除，并删除磁盘上对应的凭证文件
+（`auths/codearts-<uid>.json`），用于清理重复或不再使用的账号；操作前需二次确认。
+
 流式请求设置 `"stream_options":{"include_usage":true}` 后，会在 `[DONE]` 前返回一次
 `choices: []` 的 usage chunk；其余 chunk 的 `usage` 为 `null`。未启用时不返回 usage。
 流式和非流式均优先使用上游 usage；上游未提供时按文本长度估算，估算值不是精确 token 计数。
@@ -89,6 +103,13 @@ go run ./cmd/models -claim          # 先领取限时福利再查询（幂等，
 
 关闭后福利模型仍会出现在 `/v1/models`，但调用必然失败。
 
+> 实测 2026-11-22：华为侧福利网关当前对所有账号返回
+> `error_code=4000 invalid channel, group not found`（`/api/v1/benefit/claim` 与
+> `/api/v1/gateway/config` 同样如此），属于上游渠道侧问题，不是本服务的参数或
+> token 问题。此时面板会显示「限时福利：上游福利网关暂不可用」，但**不会**把它
+> 计入账号错误计数、冷却或禁用；活动积分签到与推理不受影响。恢复后无需改代码，
+> 下次点「领取所有账号权益」即可。
+
 ### 模型可用性探测
 
 `/v1/models` 只列**真实可用**的模型：上游的模型发现（agent-center / builtin / 福利
@@ -118,7 +139,11 @@ export CA2A_API_KEY=$(openssl rand -hex 24)
 ### 每日签到与新手积分
 
 服务默认在启动和每次 watchdog 轮询时检查活动，自动领取每日签到积分及
-上游返回的可领取新用户积分。新增账号会在下一次轮询处理；也可在 WebUI
+上游返回的可领取新用户积分。判断依据是**上游的资格结论**而不是活动 ID：
+只要上游对该账号返回 `status=ELIGIBLE` 且 `claimable=true` 就会领取，因此
+上游新增或轮换 ID 的活动（华为云已把每日签到改为每天 100 积分、活动 ID
+从 1 换成 34）无需改代码即可自动兼容；没有资格的活动上游会返回空 status
+或 `claimable=false`，这些会被静默跳过。新增账号会在下一次轮询处理；也可在 WebUI
 点击「签到」/「全员签到」，或鉴权调用 `POST /admin/api/checkin`（可传 `{"uid":"账号 ID"}`）。
 领取后必须确认；已领取未确认时只补确认，已确认不重复领取。资格、金额、
 每日刷新和活动起止时间均以上游返回为准，失败会在下一次轮询重试，
@@ -126,11 +151,13 @@ export CA2A_API_KEY=$(openssl rand -hex 24)
 
 `credits_auto_claim: false` 或 `CA2A_CREDITS_AUTO_CLAIM=0` 可关闭自动领取，
 `watch.enabled: false` 会关闭整个轮询。手动签到仍可使用。
+想跳过某个新活动，可加 `credits_exclude`（活动 ID 或标题子串，逗号分隔），
+或环境变量 `CA2A_CREDITS_EXCLUDE=34,"学生专属"`，命中则不自动领取。
 这项活动与 `benefit_auto_claim` 的模型 Token 福利独立；面板显示最近领取结果，
 不把领取量或健康账号数当作积分余额。`credit.sh` 查登录态，`apply.sh` 仅续期。
 
 当前[官方每日签到活动](https://support.huaweicloud.com/offers-codeartsagent/codeartsagent_offers_0004.html)
-为已升级积分计费的用户每日发放 1000 积分，30 天有效，活动截止于
+为已升级积分计费的用户每日发放 100 积分，30 天有效，活动截止于
 2026-12-31 00:00（UTC+8）；[新用户注册奖励](https://support.huaweicloud.com/price-codeartsagent/codeartsagent_billing_0029.html)
 为 4000 积分。无资格或已自动发放的新手奖励不会再次领取。
 
@@ -168,6 +195,7 @@ docker compose up -d --build
 | `CA2A_KEEPALIVE_WINDOW` | 保活窗口 | `10m` |
 | `CA2A_BENEFIT_AUTO_CLAIM` | 发现模型时自动领取限时福利（幂等；关闭则福利模型不可用） | `true` |
 | `CA2A_CREDITS_AUTO_CLAIM` | watchdog 自动领取每日签到及新用户积分 | `true` |
+| `CA2A_CREDITS_EXCLUDE` | 不自动领取的活动（ID 或标题子串，逗号分隔） | - |
 | `CA2A_LOGIN_CLIENT_ID` | WebUI 登录使用的 OAuth client_id | 已有账号的取值，否则 `codearts-agent` |
 
 ## 目录结构
@@ -195,4 +223,3 @@ docs/              逆向过程与接口清单
 ## License
 
 MIT
-

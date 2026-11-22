@@ -273,6 +273,26 @@ func TestOAuthRefreshClassifiesExpiredRefreshToken(t *testing.T) {
 	}
 }
 
+func TestOAuthRefreshClassifiesSTSCodeExpired(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error_code":"STS5.1806","error_msg":"invalid refresh token: 'refresh code has expired'"}`)
+	}))
+	defer srv.Close()
+	privateJWK, err := NewDPoPPrivateJWK()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultLoginConfig()
+	cfg.STSHost = srv.URL
+	_, err = New(5*time.Second).RefreshToken(context.Background(), cfg, "expired", "verifier", privateJWK)
+	var expired *RefreshTokenExpiredError
+	if !errors.As(err, &expired) {
+		t.Fatalf("refresh error=%T %v, want RefreshTokenExpiredError", err, err)
+	}
+}
+
 func decodeDPoP(t *testing.T, proof string) (map[string]any, map[string]any) {
 	t.Helper()
 	parts := strings.Split(proof, ".")

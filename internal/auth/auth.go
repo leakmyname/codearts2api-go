@@ -113,7 +113,12 @@ func New(userID, userName, domainID, token, ak, sk, expiration, refreshToken, co
 
 // FileName 返回 auth 文件名。
 func (a *Auth) FileName() string {
-	id := strings.ReplaceAll(a.UserID, string(filepath.Separator), "_")
+	return FileNameFor(a.UserID)
+}
+
+// FileNameFor 返回给定 user_id 对应的凭证文件名。
+func FileNameFor(userID string) string {
+	id := strings.ReplaceAll(userID, string(filepath.Separator), "_")
 	if id == "" {
 		id = "unknown"
 	}

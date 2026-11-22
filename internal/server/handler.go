@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -165,11 +166,14 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /admin/api/overview", h.withAuth(h.adminOverview))
 	h.mux.HandleFunc("POST /admin/api/credits", h.withAuth(h.adminCredits))
 	h.mux.HandleFunc("POST /admin/api/checkin", h.withAuth(h.adminCheckin))
+	h.mux.HandleFunc("POST /admin/api/benefits/claim", h.withAuth(h.adminClaimBenefits))
 	h.mux.HandleFunc("POST /admin/api/keepalive", h.withAuth(h.adminKeepalive))
 	h.mux.HandleFunc("POST /admin/api/reload", h.withAuth(h.adminReload))
 	h.mux.HandleFunc("POST /admin/api/accounts/enable", h.withAuth(h.adminEnable))
 	h.mux.HandleFunc("POST /admin/api/accounts/disable", h.withAuth(h.adminDisable))
 	h.mux.HandleFunc("POST /admin/api/accounts/clear-cooldown", h.withAuth(h.adminClearCooldown))
+	h.mux.HandleFunc("POST /admin/api/accounts/remove", h.withAuth(h.adminRemoveAccount))
+	h.mux.HandleFunc("POST /admin/api/credits/balance", h.withAuth(h.adminQueryCredits))
 	h.mux.HandleFunc("POST /admin/api/oauth/start", h.withAuth(h.adminOAuthStart))
 	h.mux.HandleFunc("POST /admin/api/oauth/poll", h.withAuth(h.adminOAuthPoll))
 	h.mux.HandleFunc("POST /admin/api/oauth/import-callback", h.withAuth(h.adminOAuthImportCallback))
@@ -273,13 +277,16 @@ func (h *Handler) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("<h3>换取凭证失败：" + lastErr.Error() + "</h3>" + hint))
 		return
 	}
-	if err := h.saveLoginResult(tok, sess.Verifier, sess.DPoPPrivateKey); err != nil {
+	uid, name, err := h.saveLoginResult(tok, sess.Verifier, sess.DPoPPrivateKey)
+	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte("<h3>保存账号失败：" + err.Error() + "</h3>"))
 		return
 	}
+	sess.AccountUID = uid
+	sess.AccountName = name
 	h.oauth.complete(sess.ID)
-	_, _ = w.Write([]byte("<h3>登录成功，可关闭此页面并回到 WebUI。</h3>"))
+	_, _ = w.Write([]byte("<h3>登录成功（" + name + "），可关闭此页面并回到 WebUI。</h3>"))
 }
 
 func tokName(t *upstream.TokenResponse) string {
@@ -297,9 +304,13 @@ func tokToken(t *upstream.TokenResponse) string {
 }
 
 // saveLoginResult 落盘 auth 并加入账号池。
-func (h *Handler) saveLoginResult(tok *upstream.TokenResponse, codeVerifier string, dpopPrivateJWK ...upstream.DPoPPrivateJWK) error {
+//
+// 返回落盘后的真实账号标识（uid/昵称）。注意：账号池以 a.UserID 建索引，
+// 当门户回调不携带身份时 a.UserID 会被 identityFromRefreshToken 兜底替换，
+// 与 tok.UserID 可能不一致，因此前端必须用这里返回的 uid 去校验账号是否入池。
+func (h *Handler) saveLoginResult(tok *upstream.TokenResponse, codeVerifier string, dpopPrivateJWK ...upstream.DPoPPrivateJWK) (string, string, error) {
 	if h.cfg.AuthDir == "" {
-		return errors.New("auth_dir not configured")
+		return "", "", errors.New("auth_dir not configured")
 	}
 	cred := tok.Credentials
 	var privateJWK map[string]string
@@ -329,8 +340,24 @@ func (h *Handler) saveLoginResult(tok *upstream.TokenResponse, codeVerifier stri
 			}
 		}
 	}
+	// OAuth 返回的 user_id 有时是 IAM principal id，而账号池里既有账号用的是
+	// domain/uid 标识；两者指向同一个人时会写成两个账号（重复账号）。
+	// 这里把身份规范到账号池里已存在的标识。
+	if canonical := h.canonicalUID(tok, a); canonical != "" && canonical != a.UserID {
+		log.Printf("webui login: normalize user_id %q -> %q", a.UserID, canonical)
+		a.UserID = canonical
+	}
 	if err := auth.SaveNew(h.cfg.AuthDir, a); err != nil {
-		return err
+		return "", "", err
+	}
+	// 规范化后落盘文件名变了，旧 principal id 的文件要清掉，否则重启会多出重复账号。
+	if tok.UserID != "" && tok.UserID != a.UserID {
+		stale := filepath.Join(h.cfg.AuthDir, auth.FileNameFor(tok.UserID))
+		if _, err := os.Stat(stale); err == nil {
+			if rmErr := os.Remove(stale); rmErr == nil {
+				log.Printf("webui login: removed stale credential file %s", stale)
+			}
+		}
 	}
 	if p := h.cfg.Pool.AddAccount(a); p != nil && p.Auth != nil {
 		// 刚登录的账号先不探测：用户很可能马上就要用，探测占用的上游会话
@@ -340,7 +367,61 @@ func (h *Handler) saveLoginResult(tok *upstream.TokenResponse, codeVerifier stri
 	} else {
 		log.Printf("webui login saved user_id=%s name=%s (pool add failed)", a.UserID, a.UserName)
 	}
-	return nil
+	return a.UserID, a.UserName, nil
+}
+
+// canonicalUID 把本次登录拿到的身份候选映射到账号池里已存在的标识。
+//
+// 上游 oauth2/tokens 返回的 user_id 有时是 IAM principal id（如
+// cbf07117...），而同一个人在账号池中的标识是 domain_id（如 7d831ca3...）。
+// 不做这层规范化，同一个人会被写成两个账号。
+func (h *Handler) canonicalUID(tok *upstream.TokenResponse, a *auth.Auth) string {
+	existing := map[string]bool{}
+	domainToUID := map[string]string{}
+	add := func(x *auth.Auth) {
+		if x == nil {
+			return
+		}
+		if x.UserID != "" {
+			existing[x.UserID] = true
+		}
+		if x.DomainID != "" {
+			domainToUID[x.DomainID] = x.UserID
+		}
+	}
+	if h.cfg.Pool != nil {
+		for _, acct := range h.cfg.Pool.Accounts() {
+			if acct != nil {
+				add(acct.Auth)
+			}
+		}
+	}
+	if h.cfg.AuthDir != "" {
+		if list, err := auth.LoadDir(h.cfg.AuthDir); err == nil {
+			for _, x := range list {
+				add(x)
+			}
+		}
+	}
+	candidates := []string{}
+	if tok != nil {
+		candidates = append(candidates, tok.DomainID, tok.UserID)
+	}
+	if a != nil {
+		candidates = append(candidates, a.DomainID, a.UserID)
+	}
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		if existing[c] {
+			return c
+		}
+		if uid, ok := domainToUID[c]; ok && uid != "" {
+			return uid
+		}
+	}
+	return ""
 }
 
 // lookupIdentity 用刚拿到的 STS 凭证查身份（先 caller-identity，再 current/user）。
@@ -901,7 +982,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if upstreamUnavailableReason(werr) == modelAccessDeniedReason {
 					markUnusable(acct.UID, model, modelAccessDeniedReason)
 				} else if !isParamInvalidError(werr) {
-					h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+					h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown, "stream: "+truncateMsg(werr.Error(), 300))
 				}
 			} else {
 				markUsable(acct.UID, model)
@@ -1150,11 +1231,11 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 		case ae.Status >= 500:
 			h.cfg.Pool.Cooldown(acct.Name, pool.CoolErr, h.cfg.ErrCooldown, ae.Error())
 		default:
-			h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+			h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown, ae.Error())
 		}
 		return false
 	}
-	h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+	h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown, err.Error())
 	return false
 }
 

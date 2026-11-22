@@ -35,20 +35,63 @@ type Account struct {
 	Auth   *auth.Auth       `json:"-"`
 	Client *upstream.Client `json:"-"`
 
-	mu                sync.Mutex
-	refreshMu         sync.Mutex
-	checkinMu         sync.Mutex
-	checkin           *CheckinStatus
-	lastValidated     time.Time
-	errCount          int
-	coolUntil         time.Time
-	coolKind          CoolKind
-	disabled          bool
-	disabledReason    string
-	lastErr           string
+	mu        sync.Mutex
+	refreshMu sync.Mutex
+	checkinMu sync.Mutex
+	checkin   *CheckinStatus
+	// benefit 保存最近一次限时福利领取结果，与账号健康状态分开。
+	benefit        *BenefitStatus
+	// credits 保存最近一次积分余额查询结果。
+	credits        *CreditsStatus
+	lastValidated  time.Time
+	errCount       int
+	coolUntil      time.Time
+	coolKind       CoolKind
+	disabled       bool
+	disabledReason string
+	lastErr        string
+	// lastErrMsg/lastErrAt 记录最近一次错误的原文与发生时间。
+	// 之前只保留 errCount 计数，面板上只能显示 "err 56" 这种无信息量的数字。
+	lastErrMsg string
+	lastErrAt  time.Time
+	// recentErrs 保存最近的错误明细，供面板展示「为什么出错」。
+	recentErrs        []ErrorEntry
 	activeConcurrent  int       // 当前活跃并发请求数
 	maxConcurrent     int       // 最大允许并发数
 	keepaliveLastPing time.Time // 最后保活心跳时间
+}
+
+// ErrorEntry 一条错误明细。
+type ErrorEntry struct {
+	At      time.Time `json:"at"`
+	Kind    string    `json:"kind"`
+	Message string    `json:"message"`
+}
+
+// CreditsStatus 账号积分余额。
+type CreditsStatus struct {
+	OK          bool      `json:"ok"`
+	Message     string    `json:"message"`
+	Total       float64   `json:"total"`
+	Used        float64   `json:"used"`
+	Remain      float64   `json:"remain"`
+	BonusRemain float64   `json:"bonus_remain"`
+	BasicRemain float64   `json:"basic_remain"`
+	Expiring    float64   `json:"expiring"`
+	CheckedAt   time.Time `json:"checked_at"`
+}
+
+// maxRecentErrs 保留的最近错误条数。
+const maxRecentErrs = 8
+
+// recordError 记录一条错误明细（保留最近 maxRecentErrs 条）。
+func (a *Account) recordError(kind, msg string) {
+	a.lastErrMsg = msg
+	a.lastErrAt = time.Now()
+	a.recentErrs = append(a.recentErrs, ErrorEntry{At: a.lastErrAt, Kind: kind, Message: msg})
+	if len(a.recentErrs) > maxRecentErrs {
+		a.recentErrs = a.recentErrs[len(a.recentErrs)-maxRecentErrs:]
+	}
 }
 
 // Config 池配置。
@@ -61,6 +104,13 @@ type Config struct {
 	KeepaliveWindow time.Duration        // 保活心跳窗口，超过此时间无活动则发送心跳
 	LoginConfig     upstream.LoginConfig // OAuth/refresh 端点；零值使用生产默认
 	CheckinClient   CheckinClient        // 可选活动客户端；nil 使用账号 Client
+	// BenefitClient 可选福利客户端；nil 使用账号 Client。
+	BenefitClient BenefitClient
+	// CreditsClient 可选积分余额客户端；nil 使用账号 Client。
+	CreditsClient CreditsClient
+	// CreditsExclude 活动积分自动领取的排除项（活动 ID 或标题子串）。
+	// 留空表示上游判定有资格的活动全部自动领取，新活动天然兼容。
+	CreditsExclude []string
 }
 
 // Pool 账号池。
@@ -98,12 +148,14 @@ func New(auths []*auth.Auth, cfg Config, stateFile string) (*Pool, error) {
 	}
 	p := &Pool{cfg: cfg, state: stateFile}
 	for _, a := range auths {
+		client := upstream.New(120 * time.Second)
+		client.SetCreditsExclude(cfg.CreditsExclude)
 		acct := &Account{
 			Name:              a.UserID,
 			UID:               a.UserID,
 			UserName:          a.UserName,
 			Auth:              a,
-			Client:            upstream.New(120 * time.Second),
+			Client:            client,
 			maxConcurrent:     cfg.MaxConcurrent,
 			keepaliveLastPing: time.Now(),
 		}
@@ -134,12 +186,14 @@ func (p *Pool) Get(name string) *Account {
 
 // AddAccount 动态添加账号（WebUI 登录成功后调用）。
 func (p *Pool) AddAccount(a *auth.Auth) *Account {
+	client := upstream.New(120 * time.Second)
+	client.SetCreditsExclude(p.cfg.CreditsExclude)
 	acct := &Account{
 		Name:              a.UserID,
 		UID:               a.UserID,
 		UserName:          a.UserName,
 		Auth:              a,
-		Client:            upstream.New(120 * time.Second),
+		Client:            client,
 		maxConcurrent:     p.cfg.MaxConcurrent,
 		keepaliveLastPing: time.Now(),
 	}
@@ -154,6 +208,8 @@ func (p *Pool) AddAccount(a *auth.Auth) *Account {
 			existing.disabled = false
 			existing.disabledReason = ""
 			existing.lastErr = ""
+			existing.lastErrMsg = ""
+			existing.lastErrAt = time.Time{}
 			existing.mu.Unlock()
 			p.mu.Unlock()
 			p.saveState()
@@ -191,14 +247,18 @@ func (p *Pool) List() []map[string]any {
 			"nickname":          a.UserName,
 			"user_name":         a.UserName,
 			"default_model":     a.DefaultModel,
-			"credits":           int64(0), // 保留旧字段；未查询真实余额
 			"checkin":           a.checkin,
+			"benefit":           a.benefit,
+			"credits":           a.credits,
 			"disabled":          a.disabled,
 			"cooling":           cooling,
 			"until":             until,
 			"err_count":         a.errCount,
 			"reason":            reason,
 			"last_error":        a.lastErr,
+			"last_error_msg":    a.lastErrMsg,
+			"last_error_at":     errTime(a.lastErrAt),
+			"recent_errors":     a.recentErrs,
 			"active_concurrent": a.activeConcurrent,
 			"max_concurrent":    a.maxConcurrent,
 			"token_remaining":   a.Auth.Remaining().Round(time.Minute).String(),
@@ -208,6 +268,14 @@ func (p *Pool) List() []map[string]any {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i]["uid"].(string) < out[j]["uid"].(string) })
 	return out
+}
+
+// errTime 把零值时间转成空串，便于前端直接渲染。
+func errTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339)
 }
 
 // Stats 汇总。
@@ -241,6 +309,8 @@ func (p *Pool) Enable(name string) bool {
 			a.disabled = false
 			a.disabledReason = ""
 			a.lastErr = ""
+			a.lastErrMsg = ""
+			a.lastErrAt = time.Time{}
 			a.mu.Unlock()
 			p.saveState()
 			return true
@@ -266,6 +336,21 @@ func (p *Pool) ClearCooldown(name string) bool {
 	return false
 }
 
+// RemoveAccount 从池中移除账号，返回被移除的账号。
+func (p *Pool) RemoveAccount(name string) *Account {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, a := range p.accounts {
+		if a.Name != name && a.UID != name {
+			continue
+		}
+		p.accounts = append(p.accounts[:i], p.accounts[i+1:]...)
+		p.saveState()
+		return a
+	}
+	return nil
+}
+
 // SyncToDir 用磁盘 auths 全量对齐。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
@@ -285,12 +370,14 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 			next = append(next, existing)
 			delete(byUID, a.UserID)
 		} else {
+			client := upstream.New(120 * time.Second)
+			client.SetCreditsExclude(p.cfg.CreditsExclude)
 			next = append(next, &Account{
 				Name:              a.UserID,
 				UID:               a.UserID,
 				UserName:          a.UserName,
 				Auth:              a,
-				Client:            upstream.New(120 * time.Second),
+				Client:            client,
 				maxConcurrent:     p.cfg.MaxConcurrent,
 				keepaliveLastPing: time.Now(),
 			})
@@ -373,14 +460,15 @@ func (p *Pool) Cooldown(name string, kind CoolKind, dur time.Duration, reason st
 		a.coolUntil = time.Now().Add(dur)
 		a.coolKind = kind
 		a.lastErr = reason
+		a.recordError("cooldown", reason)
 		a.mu.Unlock()
 		log.Printf("pool cooldown account=%s kind=%d dur=%s reason=%s", name, kind, dur, reason)
 	}
 	p.saveState()
 }
 
-// NoteError 累计错误。
-func (p *Pool) NoteError(name string, threshold int, cooldown time.Duration) {
+// NoteError 累计错误，并保留最近一次错误的原文供面板展示。
+func (p *Pool) NoteError(name string, threshold int, cooldown time.Duration, reason ...string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, a := range p.accounts {
@@ -389,6 +477,13 @@ func (p *Pool) NoteError(name string, threshold int, cooldown time.Duration) {
 		}
 		a.mu.Lock()
 		a.errCount++
+		msg := ""
+		if len(reason) > 0 {
+			msg = reason[0]
+		}
+		if msg != "" {
+			a.recordError("error", msg)
+		}
 		if a.errCount >= threshold {
 			a.coolUntil = time.Now().Add(cooldown)
 			a.lastErr = "consecutive errors"
@@ -421,6 +516,7 @@ func (p *Pool) Disable(name, reason string) {
 			a.disabled = true
 			a.disabledReason = reason
 			a.lastErr = reason
+			a.recordError("disabled", reason)
 			a.mu.Unlock()
 			log.Printf("pool disable account=%s reason=%s", name, reason)
 		}
@@ -664,6 +760,8 @@ func (p *Pool) RefreshToken(name string) error {
 	acct.disabled = false
 	acct.disabledReason = ""
 	acct.lastErr = ""
+	acct.lastErrMsg = ""
+	acct.lastErrAt = time.Time{}
 	acct.lastValidated = time.Now()
 	acct.mu.Unlock()
 	log.Printf("pool token refreshed manually account=%s", name)
@@ -911,12 +1009,15 @@ func (p *Pool) loadState() {
 		return
 	}
 	var data []struct {
-		Name      string    `json:"name"`
-		ErrCount  int       `json:"err_count"`
-		CoolUntil time.Time `json:"cool_until"`
-		Disabled  bool      `json:"disabled"`
-		Reason    string    `json:"reason"`
-		LastErr   string    `json:"last_error"`
+		Name       string       `json:"name"`
+		ErrCount   int          `json:"err_count"`
+		CoolUntil  time.Time    `json:"cool_until"`
+		Disabled   bool         `json:"disabled"`
+		Reason     string       `json:"reason"`
+		LastErr    string       `json:"last_error"`
+		LastErrMsg string       `json:"last_error_msg,omitempty"`
+		LastErrAt  time.Time    `json:"last_error_at,omitempty"`
+		RecentErrs []ErrorEntry `json:"recent_errors,omitempty"`
 	}
 	if json.Unmarshal(raw, &data) != nil {
 		return
@@ -930,6 +1031,9 @@ func (p *Pool) loadState() {
 				a.disabled = s.Disabled
 				a.disabledReason = s.Reason
 				a.lastErr = s.LastErr
+				a.lastErrMsg = s.LastErrMsg
+				a.lastErrAt = s.LastErrAt
+				a.recentErrs = s.RecentErrs
 				a.mu.Unlock()
 			}
 		}
@@ -941,23 +1045,29 @@ func (p *Pool) saveState() {
 		return
 	}
 	type entry struct {
-		Name      string    `json:"name"`
-		ErrCount  int       `json:"err_count"`
-		CoolUntil time.Time `json:"cool_until"`
-		Disabled  bool      `json:"disabled"`
-		Reason    string    `json:"reason"`
-		LastErr   string    `json:"last_error"`
+		Name       string       `json:"name"`
+		ErrCount   int          `json:"err_count"`
+		CoolUntil  time.Time    `json:"cool_until"`
+		Disabled   bool         `json:"disabled"`
+		Reason     string       `json:"reason"`
+		LastErr    string       `json:"last_error"`
+		LastErrMsg string       `json:"last_error_msg,omitempty"`
+		LastErrAt  time.Time    `json:"last_error_at,omitempty"`
+		RecentErrs []ErrorEntry `json:"recent_errors,omitempty"`
 	}
 	out := make([]entry, 0, len(p.accounts))
 	for _, a := range p.accounts {
 		a.mu.Lock()
 		out = append(out, entry{
-			Name:      a.Name,
-			ErrCount:  a.errCount,
-			CoolUntil: a.coolUntil,
-			Disabled:  a.disabled,
-			Reason:    a.disabledReason,
-			LastErr:   a.lastErr,
+			Name:       a.Name,
+			ErrCount:   a.errCount,
+			CoolUntil:  a.coolUntil,
+			Disabled:   a.disabled,
+			Reason:     a.disabledReason,
+			LastErr:    a.lastErr,
+			LastErrMsg: a.lastErrMsg,
+			LastErrAt:  a.lastErrAt,
+			RecentErrs: a.recentErrs,
 		})
 		a.mu.Unlock()
 	}

@@ -3,8 +3,11 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -139,6 +142,52 @@ func (h *Handler) adminCheckin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// adminClaimBenefits 领取指定账号或全部启用账号的限时福利（模型福利网关）。
+//
+// 与 adminCheckin（活动积分）不同，这里走的是福利网关 benefit/claim。
+// 上游接口幂等：已领取同样返回成功。
+func (h *Handler) adminClaimBenefits(w http.ResponseWriter, r *http.Request) {
+	body, err := readUIDBody(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "bad json: " + err.Error()})
+		return
+	}
+	if body.UID != "" && h.cfg.Pool.Get(body.UID) == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "account not found"})
+		return
+	}
+	targets := h.pickTargets(body.UID)
+	results := make([]actionResult, 0, len(targets))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 5)
+	for _, uid := range targets {
+		uid := uid
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			res := actionResult{UID: uid}
+			ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+			defer cancel()
+			if err := h.cfg.Pool.ClaimBenefit(ctx, uid); err != nil {
+				res.Message = err.Error()
+			} else {
+				res.OK = true
+				res.Message = "已领取"
+			}
+			mu.Lock()
+			results = append(results, res)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": allOK(results), "message": summaryMsg("领取限时福利", results), "results": results,
+	})
+}
+
 // adminKeepalive 刷新即将过期的 token。
 func (h *Handler) adminKeepalive(w http.ResponseWriter, r *http.Request) {
 	body, err := readUIDBody(r)
@@ -228,6 +277,82 @@ func (h *Handler) adminClearCooldown(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "已清冷却 " + body.UID})
+}
+
+// adminQueryCredits 查询账号积分余额（指定账号或全部启用账号）。
+func (h *Handler) adminQueryCredits(w http.ResponseWriter, r *http.Request) {
+	body, err := readUIDBody(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "bad json: " + err.Error()})
+		return
+	}
+	if body.UID != "" && h.cfg.Pool.Get(body.UID) == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "account not found"})
+		return
+	}
+	targets := h.pickTargets(body.UID)
+	results := make([]actionResult, 0, len(targets))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 5)
+	for _, uid := range targets {
+		uid := uid
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			res := actionResult{UID: uid}
+			ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+			defer cancel()
+			status, err := h.cfg.Pool.QueryCredits(ctx, uid)
+			if err != nil {
+				res.Message = err.Error()
+			} else {
+				res.OK = true
+				res.Credits = status.Remain
+				res.Message = fmt.Sprintf("剩余 %.2f 积分", status.Remain)
+			}
+			mu.Lock()
+			results = append(results, res)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": allOK(results), "message": summaryMsg("查询积分", results), "results": results,
+	})
+}
+
+// adminRemoveAccount 移除账号：删除池内条目与磁盘凭证文件。
+func (h *Handler) adminRemoveAccount(w http.ResponseWriter, r *http.Request) {
+	body, err := readUIDBody(r)
+	if err != nil || body.UID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "uid required"})
+		return
+	}
+	acct := h.cfg.Pool.Get(body.UID)
+	if acct == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "account not found"})
+		return
+	}
+	uid := acct.UID
+	h.cfg.Pool.RemoveAccount(uid)
+	removed := ""
+	if h.cfg.AuthDir != "" {
+		path := filepath.Join(h.cfg.AuthDir, auth.FileNameFor(uid))
+		if rmErr := os.Remove(path); rmErr == nil {
+			removed = path
+		} else if !os.IsNotExist(rmErr) {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"ok": false, "message": "已从账号池移除，但删除凭证文件失败: " + rmErr.Error(),
+			})
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "message": "已移除账号 " + uid, "uid": uid, "file_removed": removed != "",
+	})
 }
 
 func (h *Handler) pickTargets(uid string) []string {
